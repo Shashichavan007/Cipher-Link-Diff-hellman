@@ -132,22 +132,51 @@ export default function App() {
         return;
       }
 
-      // Step 3: Connect to WebSocket Server
+      // Step 3: Connect to WebSocket Server with fallback timeout
       setSessionState((prev) => ({ ...prev, handshakeStep: 3 }));
 
       // Protocol WebSocket URL resolution
+      const isLocalHost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const host = (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
-        ? '127.0.0.1:8000' 
-        : window.location.host;
+      const host = isLocalHost ? '127.0.0.1:8000' : window.location.host;
+
+      // On GitHub Pages static hosting (no live backend), default to simulated handshake after brief attempt
+      const isStaticHosting = window.location.hostname.includes('github.io') || window.location.hostname.includes('vercel.app');
 
       const wsUrl = mode === 'direct' 
         ? `${protocol}//${host}/ws/chat`
         : `${protocol}//${host}/ws/room/${roomId}/client_${Math.random().toString(36).substring(2, 6)}`;
 
-      const socket = new WebSocket(wsUrl);
-      wsRef.current = socket;
       let handshakeSucceeded = false;
+      let socket = null;
+      let connectionTimeout = null;
+
+      // Fast-track fallback for static hosting where WS server does not exist
+      if (isStaticHosting) {
+        await runSimulatedHandshake(pub);
+        return;
+      }
+
+      try {
+        socket = new WebSocket(wsUrl);
+        wsRef.current = socket;
+      } catch (err) {
+        console.warn("WebSocket instantiation error, using simulated mode:", err);
+        await runSimulatedHandshake(pub);
+        return;
+      }
+
+      // 2.5-second timeout to fall back to simulated mode if WebSocket server doesn't respond
+      connectionTimeout = setTimeout(async () => {
+        if (!handshakeSucceeded) {
+          console.warn("WebSocket connection timeout (2.5s). Falling back to client-side simulated DH session.");
+          if (wsRef.current) {
+            try { wsRef.current.close(); } catch (e) {}
+            wsRef.current = null;
+          }
+          await runSimulatedHandshake(pub);
+        }
+      }, 2500);
 
       socket.onopen = () => {
         socket.send(JSON.stringify({
@@ -162,6 +191,7 @@ export default function App() {
 
           // Handle Direct Bot (server_hello) or P2P Room (client_hello from peer)
           if (data.type === 'server_hello' || (data.type === 'client_hello' && data.sender_id)) {
+            if (connectionTimeout) clearTimeout(connectionTimeout);
             const peerPubStr = data.public_key;
             if (!peerPubStr) return;
 
@@ -197,6 +227,7 @@ export default function App() {
             });
 
           } else if (data.type === 'peer_hello_ack') {
+            if (connectionTimeout) clearTimeout(connectionTimeout);
             const peerPubStr = data.public_key;
             if (!peerPubStr) return;
 
@@ -241,6 +272,7 @@ export default function App() {
               ]);
             }
           } else if (data.type === 'error') {
+            if (connectionTimeout) clearTimeout(connectionTimeout);
             setSessionState((prev) => ({
               ...prev,
               connecting: false,
@@ -252,17 +284,16 @@ export default function App() {
         }
       };
 
-      socket.onerror = (err) => {
+      socket.onerror = async (err) => {
+        if (connectionTimeout) clearTimeout(connectionTimeout);
         if (!handshakeSucceeded) {
-          setSessionState((prev) => ({
-            ...prev,
-            connecting: false,
-            errorDetail: 'Could not connect to Python WebSocket backend server at 127.0.0.1:8000. Ensure server is running (`python -m uvicorn app.main:app --port 8000`) or test in Offline Demo Mode.'
-          }));
+          console.warn("WebSocket error encountered, switching to simulated mode...");
+          await runSimulatedHandshake(pub);
         }
       };
 
       socket.onclose = () => {
+        if (connectionTimeout) clearTimeout(connectionTimeout);
         if (handshakeSucceeded) {
           setSessionState({
             connecting: false,
